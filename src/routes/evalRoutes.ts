@@ -210,9 +210,9 @@ router.get("/health", (req: Request, res: Response) => {
  * {
  *   query?: string - the input question (required for answer_relevancy),
  *   output?: string - the response to evaluate (required for most metrics),
- *   context?: string | string[] - context for faithfulness evaluation,
- *   expected_output?: string - reference answer (for contextual_* metrics),
- *   messages?: Array<{role: string, content: string}> - conversation turns (required for conversation_completeness),
+ *   context?: string | string[] - context/retrieval_context for faithfulness/contextual_recall evaluation,
+ *   retrieval_context?: string | string[] - alias for 'context' field (supports both field names),
+ *   expected_output?: string - expected output for contextual_recall,
  *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
@@ -222,19 +222,20 @@ router.get("/health", (req: Request, res: Response) => {
  *   output?: string,
  *   context?: string[],
  *   expected_output?: string,
- *   messages?: Array<{role: string, content: string}>,
  *   evaluation: { metric, score, explanation }
  * }
  */
 router.post(
   "/eval-only",
   asyncHandler(async (req: Request, res: Response) => {
-    const { query, output, context, expected_output, metric, messages } = req.body;
+    // Support both 'context' and 'retrieval_context' field names for flexibility
+    const { query, output, expected_output, metric } = req.body;
+    const context = req.body.context || req.body.retrieval_context;
 
     // Validation
-    if (!output && !messages) {
+    if (!output) {
       return res.status(400).json({
-        error: "Missing required field: output or messages (for conversation_completeness)"
+        error: "Missing required field: output"
       });
     }
 
@@ -244,13 +245,9 @@ router.post(
     // Build evaluation parameters based on what's provided
     const evalParams: any = {
       metric: effectiveMetric,
-      provider: "groq"
+      provider: "groq",
+      output: output
     };
-
-    // Add output if provided (required for most metrics)
-    if (output) {
-      evalParams.output = output;
-    }
 
     // Add query if provided
     if (query) {
@@ -262,21 +259,16 @@ router.post(
       evalParams.context = Array.isArray(context) ? context : [context];
     }
 
-    // Add expected_output if provided
+    // Add expected_output if provided (for contextual_recall)
     if (expected_output) {
       evalParams.expected_output = expected_output;
-    }
-
-    // Add messages if provided (for conversation_completeness)
-    if (messages) {
-      evalParams.messages = messages;
     }
 
     console.log(`Direct evaluation - Metric: ${effectiveMetric}`);
     if (query) console.log(`Query: ${query}`);
     if (context) console.log(`Context: ${Array.isArray(context) ? context.length + ' items' : context.substring(0, 100) + '...'}`);
     if (output) console.log(`Output: ${output.substring(0, 100)}...`);
-    if (messages) console.log(`Messages: ${messages.length} conversation turns`);
+    if (expected_output) console.log(`Expected Output: ${expected_output.substring(0, 100)}...`);
 
     // Evaluate using specified metric (no LLM generation needed)
     const evalResult = await evalWithFields(evalParams);
@@ -296,7 +288,6 @@ router.post(
     if (query) response.query = query;
     if (context) response.context = evalParams.context;
     if (expected_output) response.expected_output = expected_output;
-    if (messages) response.messages = messages;
 
     res.json(response);
   })
@@ -316,15 +307,13 @@ router.get("/metrics", async (req: Request, res: Response) => {
       ...metricsInfo,
       usage_examples: {
         faithfulness: "Measures alignment with provided context - ideal for RAG systems",
-        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems", 
-        contextual_precision: "Measures precision of retrieved context - useful for retrieval evaluation",
-        contextual_recall: "Measures coverage of expected information - helpful for completeness checking"
+        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems"
       }
     });
   } catch (error) {
     res.status(500).json({
       error: "Could not fetch metrics information",
-      available_metrics: ["faithfulness", "answer_relevancy", "contextual_precision", "contextual_recall"]
+      available_metrics: ["faithfulness", "answer_relevancy"]
     });
   }
 });

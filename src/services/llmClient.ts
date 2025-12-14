@@ -28,7 +28,7 @@ async function callOpenAI(prompt: string, model: string, temperature: number = 0
  */
 async function callGroq(prompt: string, model: string, temperature: number = 0.7): Promise<string> {
   const res = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
+    "https://api.openai.com/openai/v1/chat/completions",
     {
       model,
       messages: [{ role: "user", content: prompt }],

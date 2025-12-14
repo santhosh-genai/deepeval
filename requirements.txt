@@ -5,6 +5,6 @@ fastapi==0.115.0
 uvicorn==0.31.0
 pydantic==2.12.4
 python-dotenv==1.2.1
-deepeval==3.7.0
+deepeval==3.7.0hi
 litellm==1.43.0
 
