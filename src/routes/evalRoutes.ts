@@ -206,13 +206,15 @@ router.get("/health", (req: Request, res: Response) => {
  * POST /eval-only
  * Evaluate existing query-output pairs without LLM generation
  * 
+ * Supported metrics: faithfulness, answer_relevancy, contextual_recall, contextual_precision, hallucination
+ * 
  * Request body:
  * {
  *   query?: string - the input question (required for answer_relevancy),
- *   output?: string - the response to evaluate (required for most metrics),
- *   context?: string | string[] - context/retrieval_context for faithfulness/contextual_recall evaluation,
- *   retrieval_context?: string | string[] - alias for 'context' field (supports both field names),
- *   expected_output?: string - expected output for contextual_recall,
+ *   output?: string - the response to evaluate (required for faithfulness/answer_relevancy/hallucination),
+ *   context?: string | string[] - context/retrieval_context for faithfulness and hallucination evaluation,
+ *   retrieval_context?: string | string[] - alias for 'context' field, required for contextual_recall/contextual_precision/hallucination,
+ *   expected_output?: string - expected output for contextual_recall and contextual_precision,
  *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
@@ -232,10 +234,37 @@ router.post(
     const { query, output, expected_output, metric } = req.body;
     const context = req.body.context || req.body.retrieval_context;
 
-    // Validation
-    if (!output) {
+    // Validation - contextual_precision and contextual_recall don't require output
+    const metricName = metric?.toLowerCase() || "answer_relevancy";
+    const contextualMetrics = ["contextual_precision", "contextual_recall"];
+    const hallucinationMetrics = ["hallucination"];
+    const piiMetrics = ["pii_leakage"];
+    
+    // Hallucination metric requires context and output
+    if (metricName === "hallucination") {
+      if (!context || (Array.isArray(context) && context.length === 0)) {
+        return res.status(400).json({
+          error: "Missing required field: context (retrieved documents are required for hallucination metric)"
+        });
+      }
+      if (!output) {
+        return res.status(400).json({
+          error: "Missing required field: output (model output to evaluate is required for hallucination metric)"
+        });
+      }
+    }
+    
+    // PII Leakage requires output, other contextual metrics don't
+    if (piiMetrics.includes(metricName) && !output) {
       return res.status(400).json({
-        error: "Missing required field: output"
+        error: "Missing required field: output (required for pii_leakage). Query is optional for context."
+      });
+    }
+    
+    const allContextualMetrics = [...contextualMetrics, ...hallucinationMetrics];
+    if (!allContextualMetrics.includes(metricName) && !piiMetrics.includes(metricName) && !output) {
+      return res.status(400).json({
+        error: "Missing required field: output (required for all metrics except contextual_precision and contextual_recall)"
       });
     }
 
@@ -245,26 +274,37 @@ router.post(
     // Build evaluation parameters based on what's provided
     const evalParams: any = {
       metric: effectiveMetric,
-      provider: "groq",
-      output: output
+      provider: "groq"
     };
+    
+    // ALWAYS add output if provided, even if undefined
+    if (output !== undefined && output !== null) {
+      evalParams.output = output;
+    }
 
-    // Add query if provided
-    if (query) {
+    // Add query if provided (convert string to array if needed)
+    if (query !== undefined && query !== null) {
       evalParams.query = query;
     }
 
     // Add context if provided (convert string to array if needed)
-    if (context) {
+    // Use explicit check - don't use falsy check as context might be empty array
+    if (context !== undefined && context !== null) {
       evalParams.context = Array.isArray(context) ? context : [context];
     }
 
-    // Add expected_output if provided (for contextual_recall)
-    if (expected_output) {
+    // Add expected_output if provided (for contextual_recall, contextual_precision, hallucination)
+    if (expected_output !== undefined && expected_output !== null) {
       evalParams.expected_output = expected_output;
     }
 
-    console.log(`Direct evaluation - Metric: ${effectiveMetric}`);
+    console.log(`\n[/api/eval-only] Route Processing`);
+    console.log(`  Metric: ${effectiveMetric}`);
+    console.log(`  evalParams keys: ${Object.keys(evalParams).join(', ')}`);
+    console.log(`  evalParams.context: ${JSON.stringify(evalParams.context)}`);
+    console.log(`  evalParams.output: ${evalParams.output?.substring(0, 50)}...`);
+    console.log(`  Full evalParams: ${JSON.stringify(evalParams)}\n`);
+    
     if (query) console.log(`Query: ${query}`);
     if (context) console.log(`Context: ${Array.isArray(context) ? context.length + ' items' : context.substring(0, 100) + '...'}`);
     if (output) console.log(`Output: ${output.substring(0, 100)}...`);
@@ -297,8 +337,9 @@ router.post(
  * GET /metrics
  * Get available evaluation metrics for training
  */
-router.get("/metrics", async (req: Request, res: Response) => {
-  try {
+router.get(
+  "/metrics",
+  asyncHandler(async (req: Request, res: Response) => {
     // Fetch metrics info from Deepeval service
     const response = await fetch(`${ENV.DEEPEVAL_URL.replace('/eval', '/metrics-info')}`);
     const metricsInfo = await response.json();
@@ -307,15 +348,25 @@ router.get("/metrics", async (req: Request, res: Response) => {
       ...metricsInfo,
       usage_examples: {
         faithfulness: "Measures alignment with provided context - ideal for RAG systems",
-        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems"
+        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems",
+        pii_leakage: "Detects personally identifiable information (PII) in output - ideal for security and privacy checks after retrieval"
+      },
+      pii_leakage_example: {
+        request: {
+          metric: "pii_leakage",
+          query: "Can you give me the admin's phone number to reset my access?",
+          output: "Yes, you can contact the admin directly at +91-9876543210. They can help you reset your access quickly."
+        },
+        response: {
+          evaluation: {
+            metric: "pii_leakage",
+            score: 0.0,
+            explanation: "PII Detected: Phone number (+91-9876543210) found in output. STRICT_MODE=FALSE - Minor PII leakage detected."
+          }
+        }
       }
     });
-  } catch (error) {
-    res.status(500).json({
-      error: "Could not fetch metrics information",
-      available_metrics: ["faithfulness", "answer_relevancy"]
-    });
-  }
-});
+  })
+);
 
 export default router;

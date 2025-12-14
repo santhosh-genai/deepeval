@@ -51,11 +51,19 @@ class EvalRequest(BaseModel):
     """Request body for evaluation.
     
     Properly separates user query, retrieved context, and model output for accurate metric scoring.
+    
+    Field Requirements by Metric:
+    - faithfulness: output (required), context (recommended), query (optional)
+    - answer_relevancy: query (required), output (required), context (optional)
+    - hallucination: context (required), output (required), query (optional)
+    - contextual_recall: context (required), expected_output (required), query (optional)
+    - contextual_precision: context (required), expected_output (required), query (optional)
+    - pii_leakage: output (required), query (optional)
     """
     query: Optional[str] = None  # what the user asked
     context: Optional[List[str]] = None  # list of retrieved docs or source passages
     output: Optional[str] = None  # model's answer to be evaluated (REQUIRED for most metrics)
-    expected_output: Optional[str] = None  # expected/ideal output (for contextual_recall)
+    expected_output: Optional[str] = None  # expected/ideal output (for contextual_recall, contextual_precision)
     provider: Optional[str] = None  # LLM provider: 'groq' or 'openai'
     metric: Optional[Union[str, List[str]]] = "faithfulness"  # metric(s) to evaluate - string, array, or "all"
 
@@ -181,7 +189,10 @@ class MetricEvaluator:
     SUPPORTED_METRICS = {
         "faithfulness": "Evaluates if the output is faithful to the source context (hybrid: LLM judgment + hallucination detection)",
         "answer_relevancy": "Evaluates how relevant the answer is to the input question (hybrid: LLM judgment + definition enforcement)",
-        "contextual_recall": "Evaluates how much relevant context from retrieval is recalled in expected output (requires retrieval_context + expected_output)"
+        "contextual_recall": "Evaluates how much relevant context from retrieval is recalled in expected output (requires retrieval_context + expected_output)",
+        "contextual_precision": "Evaluates how much of the retrieved context is relevant to answering the query (requires retrieval_context + expected_output)",
+        "hallucination": "Evaluates if the output contains information not grounded in the retrieved context (hallucinated content). Stage: After Retrieval. (requires context + output)",
+        "pii_leakage": "Evaluates if the output contains personally identifiable information (PII) that should not be leaked. Detects phone numbers, emails, SSN, credit cards, etc. Stage: After Retrieval. (requires output, query is optional for context)"
     }
     
     def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile", use_groq: bool = False):
@@ -219,22 +230,36 @@ class MetricEvaluator:
         context: Optional[List[str]],
         output: str,
         expected_output: Optional[str] = None,
+        metric_name: Optional[str] = None,
     ):
         """Create a standardized test case for evaluation.
         
-        Note: expected_output is used for contextual_recall metric.
+        Creates an LLMTestCase with proper field mapping for different metrics:
+        - All metrics: uses retrieval_context for context
+        - Hallucination: may also need 'context' attribute set directly
         """
         from deepeval.test_case import LLMTestCase
         
         # Ensure context is always a list for deepeval
-        retrieval_ctx = context or []
+        retrieval_ctx = context if context else []
         
-        return LLMTestCase(
+        logger.info(f"[create_test_case] metric_name: {metric_name}, context list length: {len(retrieval_ctx)}")
+        
+        test_case = LLMTestCase(
             input=query or "",  # user question
             actual_output=output,  # model response
             retrieval_context=retrieval_ctx,  # RAG/context
             expected_output=expected_output  # used by contextual_recall
         )
+        
+        # For hallucination metric specifically, set context attribute directly
+        # because HallucinationMetric may look for test_case.context
+        if metric_name and "hallucination" in metric_name.lower():
+            logger.info(f"[create_test_case] Hallucination metric detected - setting context attribute")
+            test_case.context = retrieval_ctx  # Set context directly for HallucinationMetric
+        
+        logger.info(f"[create_test_case] Test case setup complete - retrieval_context: {len(test_case.retrieval_context) if hasattr(test_case, 'retrieval_context') else 'N/A'} items")
+        return test_case
     
     def evaluate_faithfulness(self, test_case) -> tuple[float, str]:
         """
@@ -295,6 +320,79 @@ class MetricEvaluator:
         explanation = metric.reason or "Contextual Recall (DeepEval core)."
         return score, explanation
 
+    def evaluate_contextual_precision(self, test_case) -> tuple[float, str]:
+        """
+        Pure DeepEval Contextual Precision:
+        - Measures how much of the retrieved context is relevant to answering the query
+        - Requires retrieval_context (list of retrieved docs) and expected_output
+        - Uses strict_mode=False for natural LLM judgment with include_reason=True
+        """
+        from deepeval.metrics.contextual_precision.contextual_precision import ContextualPrecisionMetric
+
+        metric = ContextualPrecisionMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False
+        )
+
+        score = metric.measure(test_case)
+        explanation = metric.reason or "Contextual Precision (DeepEval core)."
+        return score, explanation
+
+    def evaluate_hallucination(self, test_case) -> tuple[float, str]:
+        """
+        Pure DeepEval Hallucination:
+        - Detects when output contains information not grounded in the retrieved context
+        - Measures the degree to which the output contains hallucinated/ungrounded claims
+        - Requires retrieval_context (list of retrieved docs) as non-empty
+        - Stage: After Retrieval
+        - Uses strict_mode=False for natural LLM judgment with include_reason=True
+        """
+        from deepeval.metrics.hallucination.hallucination import HallucinationMetric
+
+        logger.info(f"[Hallucination] Test case retrieval_context: {test_case.retrieval_context}")
+        logger.info(f"[Hallucination] Test case actual_output: {test_case.actual_output}")
+        
+        # Check if retrieval_context is properly set
+        if not test_case.retrieval_context:
+            logger.error(f"[Hallucination] retrieval_context is empty or None!")
+            logger.error(f"[Hallucination] test_case.__dict__: {test_case.__dict__}")
+            raise ValueError("Test case retrieval_context is None or empty - cannot evaluate hallucination")
+        
+        metric = HallucinationMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False
+        )
+
+        score = metric.measure(test_case)
+        explanation = metric.reason or "Hallucination (DeepEval core)."
+        return score, explanation
+
+    def evaluate_pii_leakage(self, test_case) -> tuple[float, str]:
+        """
+        Pure DeepEval PII Leakage:
+        - Detects if output contains personally identifiable information (PII)
+        - Checks for phone numbers, emails, SSN, credit cards, passport numbers, etc.
+        - Stage: After Retrieval
+        - Requires output, query is optional for context
+        - Uses strict_mode=False for natural LLM judgment with include_reason=True
+        """
+        from deepeval.metrics.pii_leakage.pii_leakage import PIILeakageMetric
+
+        metric = PIILeakageMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False
+        )
+
+        score = metric.measure(test_case)
+        explanation = metric.reason or "PII Leakage (DeepEval core)."
+        return score, explanation
+
 
 
     def evaluate(
@@ -341,13 +439,27 @@ class MetricEvaluator:
                 raise ValueError("contextual_recall requires 'context' field (retrieved documents) - received None or empty list")
             if not expected_output:
                 raise ValueError("contextual_recall requires 'expected_output' field (ideal output to measure against)")
+        elif metric_name == "contextual_precision":
+            if context is None or (isinstance(context, list) and len(context) == 0):
+                raise ValueError("contextual_precision requires 'context' or 'retrieval_context' field (retrieved documents) - received None or empty list")
+            if not expected_output:
+                raise ValueError("contextual_precision requires 'expected_output' field (ideal output to measure against)")
+        elif metric_name == "hallucination":
+            if context is None or (isinstance(context, list) and len(context) == 0):
+                raise ValueError("hallucination requires 'context' or 'retrieval_context' field (retrieved documents) - received None or empty list")
+            if not output:
+                raise ValueError("hallucination requires 'output' field (model output to evaluate for hallucinations)")
+        elif metric_name == "pii_leakage":
+            if not output:
+                raise ValueError("pii_leakage requires 'output' field (text to check for PII). Query is optional for context.")
         
         # Create test case with proper structure
         test_case = self.create_test_case(
             query=query,
             context=context,
             output=output,
-            expected_output=expected_output
+            expected_output=expected_output,
+            metric_name=metric_name
         )
         
         # Route to appropriate evaluation method
@@ -357,6 +469,12 @@ class MetricEvaluator:
             return self.evaluate_answer_relevancy(test_case)
         elif metric_name == "contextual_recall":
             return self.evaluate_contextual_recall(test_case)
+        elif metric_name == "contextual_precision":
+            return self.evaluate_contextual_precision(test_case)
+        elif metric_name == "hallucination":
+            return self.evaluate_hallucination(test_case)
+        elif metric_name == "pii_leakage":
+            return self.evaluate_pii_leakage(test_case)
         else:
             raise ValueError(f"Metric {metric_name} is not implemented yet")
 
@@ -465,6 +583,12 @@ async def evaluate_llm_response(req: EvalRequest):
         results = []
         for metric_name in metrics_to_eval:
             try:
+                # Special logging for hallucination metric
+                if metric_name.lower() == "hallucination":
+                    logger.info(f"[Hallucination Metric Debug] Context before evaluate: {req.context}")
+                    logger.info(f"[Hallucination Metric Debug] Context type: {type(req.context)}")
+                    logger.info(f"[Hallucination Metric Debug] Context is None: {req.context is None}")
+                
                 score, explanation = evaluator.evaluate(
                     metric_name=metric_name,
                     query=req.query,
@@ -599,6 +723,16 @@ async def metrics_info():
         "answer_relevancy": {
             "required": ["query", "output"],
             "recommended": ["context"],
+            "optional": []
+        },
+        "contextual_recall": {
+            "required": ["expected_output"],
+            "recommended": ["retrieval_context", "query"],
+            "optional": []
+        },
+        "contextual_precision": {
+            "required": ["expected_output"],
+            "recommended": ["retrieval_context", "query"],
             "optional": []
         }
     }
