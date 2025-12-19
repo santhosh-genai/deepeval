@@ -108,6 +108,7 @@ export async function evalWithFields(params: {
   context?: string[];
   output?: string;
   expected_output?: string;
+  messages?: any[];
   metric?: string;
   provider?: string;
 }): Promise<EvalResult> {
@@ -115,11 +116,19 @@ export async function evalWithFields(params: {
     metric: params.metric || "faithfulness",
   };
 
-  // For all metrics, output is required
-  if (!params.output) {
-    throw new Error("output field is required");
+  // For conversation_completeness, messages is required (not output)
+  // For all other metrics, output is required
+  if (params.metric?.toLowerCase() === "conversation_completeness") {
+    if (!params.messages || (Array.isArray(params.messages) && params.messages.length === 0)) {
+      throw new Error("messages field is required for conversation_completeness metric");
+    }
+    payload.messages = params.messages;
+  } else {
+    if (!params.output) {
+      throw new Error("output field is required");
+    }
+    payload.output = params.output;
   }
-  payload.output = params.output;
 
   // Add optional fields - use explicit checks instead of truthiness
   if (params.query !== undefined) payload.query = params.query;
@@ -158,6 +167,68 @@ export async function evalFaithfulness(
   provider?: string
 ): Promise<EvalResult> {
   return evalWithMetric(contextOrQuery, output, "faithfulness", provider);
+}
+
+/**
+ * Evaluate bias metric.
+ * 
+ * Evaluates whether the output exhibits social biases based on the input query.
+ * Stage: After Retrieval
+ * 
+ * @param query - User question (REQUIRED for context)
+ * @param output - Model's generated response (REQUIRED for evaluation)
+ * @param retrieval_context - Retrieved documents (optional for additional context)
+ * @returns Evaluation result with bias score (0.0 = high bias, 1.0 = no bias)
+ */
+export async function evalBias(
+  query: string,
+  output: string,
+  retrieval_context?: string | string[],
+  provider?: string
+): Promise<EvalResult> {
+  if (!query) {
+    throw new Error("evalBias: query (user question) is required");
+  }
+  if (!output) {
+    throw new Error("evalBias: output (model response) is required");
+  }
+
+  const payload: any = {
+    metric: "bias",
+    query,
+    output
+  };
+
+  // Handle retrieval_context if provided
+  if (retrieval_context) {
+    if (Array.isArray(retrieval_context)) {
+      payload.retrieval_context = retrieval_context;
+    } else if (typeof retrieval_context === "string") {
+      payload.retrieval_context = [retrieval_context];
+    }
+  }
+
+  if (provider) {
+    payload.provider = provider;
+  }
+
+  try {
+    const res = await axios.post<EvalResult>(ENV.DEEPEVAL_URL, payload);
+    return res.data;
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      if ((err as any).code === "ECONNREFUSED") {
+        throw new Error(
+          `DeepEval service unavailable at ${ENV.DEEPEVAL_URL}. Is it running?`
+        );
+      }
+      const errorDetail = err.response?.data?.detail || err.message;
+      throw new Error(
+        `DeepEval Error (${err.response?.status || 'unknown'}): ${errorDetail}`
+      );
+    }
+    throw err;
+  }
 }
 
 /**

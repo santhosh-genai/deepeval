@@ -24,6 +24,9 @@ from openai import OpenAI
 # Load environment variables
 load_dotenv()
 
+# Import Bias metric from deepeval
+from deepeval.metrics.bias.bias import BiasMetric
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,15 +58,19 @@ class EvalRequest(BaseModel):
     Field Requirements by Metric:
     - faithfulness: output (required), context (recommended), query (optional)
     - answer_relevancy: query (required), output (required), context (optional)
+    - bias: query (required), output (required), retrieval_context (optional) - Stage: After Retrieval
     - hallucination: context (required), output (required), query (optional)
     - contextual_recall: context (required), expected_output (required), query (optional)
     - contextual_precision: context (required), expected_output (required), query (optional)
     - pii_leakage: output (required), query (optional)
+    - conversation_completeness: messages (required), expected_output (optional) - Stage: After Retrieval
     """
     query: Optional[str] = None  # what the user asked
     context: Optional[List[str]] = None  # list of retrieved docs or source passages
     output: Optional[str] = None  # model's answer to be evaluated (REQUIRED for most metrics)
-    expected_output: Optional[str] = None  # expected/ideal output (for contextual_recall, contextual_precision)
+    expected_output: Optional[str] = None  # expected/ideal output (for contextual_recall, contextual_precision, conversation_completeness)
+    retrieval_context: Optional[List[str]] = None  # alias for context (used by bias metric)
+    messages: Optional[List[dict]] = None  # conversation messages list with role and content (for conversation_completeness)
     provider: Optional[str] = None  # LLM provider: 'groq' or 'openai'
     metric: Optional[Union[str, List[str]]] = "faithfulness"  # metric(s) to evaluate - string, array, or "all"
 
@@ -182,6 +189,9 @@ class MetricEvaluator:
       
     - Contextual Precision/Recall: Natural LLM scoring without additional rules
     
+    - Conversation Completeness: Natural LLM scoring to evaluate if assistant responses fully address 
+      user queries in a multi-turn conversation context
+    
     This hybrid approach leverages model intelligence while catching common failure patterns.
     OpenAI models (like gpt-4o-mini) provide stricter base scoring than Groq models.
     """
@@ -189,10 +199,12 @@ class MetricEvaluator:
     SUPPORTED_METRICS = {
         "faithfulness": "Evaluates if the output is faithful to the source context (hybrid: LLM judgment + hallucination detection)",
         "answer_relevancy": "Evaluates how relevant the answer is to the input question (hybrid: LLM judgment + definition enforcement)",
+        "bias": "Evaluates whether the output exhibits social biases based on the input query. Stage: After Retrieval. (requires query and output; retrieval_context is optional)",
         "contextual_recall": "Evaluates how much relevant context from retrieval is recalled in expected output (requires retrieval_context + expected_output)",
         "contextual_precision": "Evaluates how much of the retrieved context is relevant to answering the query (requires retrieval_context + expected_output)",
         "hallucination": "Evaluates if the output contains information not grounded in the retrieved context (hallucinated content). Stage: After Retrieval. (requires context + output)",
-        "pii_leakage": "Evaluates if the output contains personally identifiable information (PII) that should not be leaked. Detects phone numbers, emails, SSN, credit cards, etc. Stage: After Retrieval. (requires output, query is optional for context)"
+        "pii_leakage": "Evaluates if the output contains personally identifiable information (PII) that should not be leaked. Detects phone numbers, emails, SSN, credit cards, etc. Stage: After Retrieval. (requires output, query is optional for context)",
+        "conversation_completeness": "Evaluates if assistant responses fully address user queries in a multi-turn conversation. Stage: After Retrieval. (requires messages list, expected_output is optional)"
     }
     
     def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile", use_groq: bool = False):
@@ -231,12 +243,14 @@ class MetricEvaluator:
         output: str,
         expected_output: Optional[str] = None,
         metric_name: Optional[str] = None,
+        messages: Optional[List[dict]] = None,
     ):
         """Create a standardized test case for evaluation.
         
         Creates an LLMTestCase with proper field mapping for different metrics:
         - All metrics: uses retrieval_context for context
         - Hallucination: may also need 'context' attribute set directly
+        - Conversation Completeness: uses messages for multi-turn conversation context
         """
         from deepeval.test_case import LLMTestCase
         
@@ -279,6 +293,26 @@ class MetricEvaluator:
 
         score = metric.measure(test_case)      # DeepEval computes truths/claims/verdicts internally
         explanation = metric.reason or "Faithfulness (DeepEval core)."
+        return score, explanation
+
+    def evaluate_bias(self, test_case) -> tuple[float, str]:
+        """
+        Pure DeepEval Bias:
+        - Evaluates whether the output exhibits social biases based on the input query.
+        - Uses DeepEval's native bias detection with verdicts and score.
+        - Stage: After Retrieval
+        - Requires query and output; retrieval_context is optional.
+        - Uses strict_mode=False for natural LLM judgment with include_reason=True
+        """
+        metric = BiasMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False
+        )
+
+        score = metric.measure(test_case)
+        explanation = metric.reason or "Bias evaluation (DeepEval core)."
         return score, explanation
 
     def evaluate_answer_relevancy(self, test_case) -> tuple[float, str]:
@@ -393,6 +427,59 @@ class MetricEvaluator:
         explanation = metric.reason or "PII Leakage (DeepEval core)."
         return score, explanation
 
+    def evaluate_conversation_completeness(self, test_case, messages: List[dict]) -> tuple[float, str]:
+        """
+        Pure DeepEval Conversation Completeness:
+        - Evaluates if assistant responses fully address user queries in a multi-turn conversation
+        - Measures the completeness of conversational responses across dialogue turns
+        - Requires messages (list of conversation turns with role and content); expected_output is optional
+        - Stage: After Retrieval
+        - Uses strict_mode=False for natural LLM judgment with include_reason=True
+        
+        Args:
+            test_case: Not used for conversation_completeness (ConversationalTestCase is created here)
+            messages: List of message dicts with 'role' and 'content' keys
+                     Example: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        
+        Returns:
+            Tuple of (score, explanation)
+        """
+        from deepeval.metrics.conversation_completeness.conversation_completeness import ConversationCompletenessMetric
+        from deepeval.test_case import ConversationalTestCase, Turn
+
+        logger.info(f"[Conversation Completeness] Messages count: {len(messages) if messages else 0}")
+        
+        if not messages:
+            logger.error(f"[Conversation Completeness] messages is empty or None!")
+            raise ValueError("Test case messages is None or empty - cannot evaluate conversation completeness")
+        
+        # Convert message dicts to Turn objects for ConversationalTestCase
+        turns = []
+        for msg in messages:
+            role = msg.get("role", "").lower()
+            content = msg.get("content", "")
+            if role and content:
+                turns.append(Turn(role=role, content=content))
+        
+        if not turns:
+            raise ValueError("No valid turns extracted from messages")
+        
+        # Create ConversationalTestCase with turns
+        conversational_test_case = ConversationalTestCase(
+            turns=turns,
+            expected_output=test_case.expected_output if hasattr(test_case, 'expected_output') else None
+        )
+        
+        metric = ConversationCompletenessMetric(
+            model=self.model,
+            include_reason=True,
+            async_mode=False,
+            strict_mode=False
+        )
+
+        score = metric.measure(conversational_test_case)
+        explanation = metric.reason or "Conversation Completeness (DeepEval core)."
+        return score, explanation
 
 
     def evaluate(
@@ -402,7 +489,8 @@ class MetricEvaluator:
         query: Optional[str] = None,
         context: Optional[List[str]] = None,
         output: str = "",
-        expected_output: Optional[str] = None
+        expected_output: Optional[str] = None,
+        messages: Optional[List[dict]] = None
     ) -> tuple[float, str]:
         """Main evaluation method that routes to specific metric evaluators.
         
@@ -411,13 +499,15 @@ class MetricEvaluator:
         - faithfulness: output required, context + query recommended
         - answer_relevancy: query + output required
         - contextual_recall: context + expected_output required
+        - conversation_completeness: messages required, expected_output optional
         
         Args:
             metric_name: Which metric to evaluate
             query: User's question or input (optional for most metrics)
             context: List of retrieved documents or source passages (optional for some metrics)
             output: Model's generated response (required for most metrics)
-            expected_output: Expected/ideal output (required for contextual_recall)
+            expected_output: Expected/ideal output (required for contextual_recall, optional for conversation_completeness)
+            messages: List of conversation messages with 'role' and 'content' (required for conversation_completeness)
             
         Returns:
             Tuple of (score, explanation)
@@ -431,9 +521,14 @@ class MetricEvaluator:
             raise ValueError(f"Unsupported metric: {metric_name}. Supported: {list(self.SUPPORTED_METRICS.keys())}")
         
         # Validate metric-specific requirements
-        if metric_name == "answer_relevancy":
+        elif metric_name == "answer_relevancy":
             if not query:
                 raise ValueError("answer_relevancy requires 'query' field (the user's question)")
+        elif metric_name == "bias":
+            if not query:
+                raise ValueError("bias requires 'query' field (the user's question)")
+            if not output:
+                raise ValueError("bias requires 'output' field (the model's response to check for bias)")
         elif metric_name == "contextual_recall":
             if context is None or (isinstance(context, list) and len(context) == 0):
                 raise ValueError("contextual_recall requires 'context' field (retrieved documents) - received None or empty list")
@@ -452,6 +547,9 @@ class MetricEvaluator:
         elif metric_name == "pii_leakage":
             if not output:
                 raise ValueError("pii_leakage requires 'output' field (text to check for PII). Query is optional for context.")
+        elif metric_name == "conversation_completeness":
+            if not messages or (isinstance(messages, list) and len(messages) == 0):
+                raise ValueError("conversation_completeness requires 'messages' field (list of conversation turns) - received None or empty list")
         
         # Create test case with proper structure
         test_case = self.create_test_case(
@@ -459,7 +557,8 @@ class MetricEvaluator:
             context=context,
             output=output,
             expected_output=expected_output,
-            metric_name=metric_name
+            metric_name=metric_name,
+            messages=messages
         )
         
         # Route to appropriate evaluation method
@@ -467,6 +566,8 @@ class MetricEvaluator:
             return self.evaluate_faithfulness(test_case)
         elif metric_name == "answer_relevancy":
             return self.evaluate_answer_relevancy(test_case)
+        elif metric_name == "bias":
+            return self.evaluate_bias(test_case)
         elif metric_name == "contextual_recall":
             return self.evaluate_contextual_recall(test_case)
         elif metric_name == "contextual_precision":
@@ -475,6 +576,8 @@ class MetricEvaluator:
             return self.evaluate_hallucination(test_case)
         elif metric_name == "pii_leakage":
             return self.evaluate_pii_leakage(test_case)
+        elif metric_name == "conversation_completeness":
+            return self.evaluate_conversation_completeness(test_case, messages=messages)
         else:
             raise ValueError(f"Metric {metric_name} is not implemented yet")
 
@@ -559,11 +662,19 @@ async def evaluate_llm_response(req: EvalRequest):
     for metric_name in metrics_to_eval:
         metric_name_lower = metric_name.lower()
         
-        if not req.output:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"output field is required for {metric_name_lower} metric"
-            )
+        # Conversation completeness needs messages, not output
+        if metric_name_lower == "conversation_completeness":
+            if not req.messages:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"messages field is required for {metric_name_lower} metric"
+                )
+        else:
+            if not req.output:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"output field is required for {metric_name_lower} metric"
+                )
     
     try:
         logger.info(f"=== Evaluation Request ===")
@@ -575,6 +686,8 @@ async def evaluate_llm_response(req: EvalRequest):
         logger.info(f"Output length: {len(req.output) if req.output else 0}")
         if req.expected_output:
             logger.info(f"Expected output length: {len(req.expected_output)}")
+        if req.messages:
+            logger.info(f"Messages count: {len(req.messages)}")
         
         # Initialize evaluator from environment
         evaluator = init_evaluator_from_env()
@@ -589,12 +702,18 @@ async def evaluate_llm_response(req: EvalRequest):
                     logger.info(f"[Hallucination Metric Debug] Context type: {type(req.context)}")
                     logger.info(f"[Hallucination Metric Debug] Context is None: {req.context is None}")
                 
+                # Special logging for conversation_completeness
+                if metric_name.lower() == "conversation_completeness":
+                    logger.info(f"[Conversation Completeness Debug] Messages before evaluate: {len(req.messages) if req.messages else 0}")
+                    logger.info(f"[Conversation Completeness Debug] Expected output: {req.expected_output[:100] + '...' if req.expected_output and len(req.expected_output) > 100 else req.expected_output}")
+                
                 score, explanation = evaluator.evaluate(
                     metric_name=metric_name,
                     query=req.query,
                     context=req.context,
                     output=req.output,
-                    expected_output=req.expected_output
+                    expected_output=req.expected_output,
+                    messages=req.messages
                 )
                 
                 results.append(MetricResult(
@@ -734,6 +853,11 @@ async def metrics_info():
             "required": ["expected_output"],
             "recommended": ["retrieval_context", "query"],
             "optional": []
+        },
+        "conversation_completeness": {
+            "required": ["messages"],
+            "recommended": ["query"],
+            "optional": ["context", "expected_output"]
         }
     }
     
@@ -760,11 +884,13 @@ async def metrics_info():
             "multiple": 'metric=["faithfulness", "answer_relevancy"]',
             "all": 'metric="all" - evaluates all available metrics'
         },
-        "training_note": "Each metric can be used independently for step-by-step learning. Uses hybrid approach: strict_mode=False for natural LLM judgment, plus custom post-processing to catch common failures. Faithfulness detects entity hallucinations. Answer Relevancy enforces definitional answers for 'What is...' questions. OpenAI models provide naturally stricter base scoring than Groq models.",
+        "training_note": "Each metric can be used independently for step-by-step learning. Uses hybrid approach: strict_mode=False for natural LLM judgment, plus custom post-processing to catch common failures. Faithfulness detects entity hallucinations. Answer Relevancy enforces definitional answers for 'What is...' questions. Conversation Completeness evaluates multi-turn conversation quality. OpenAI models provide naturally stricter base scoring than Groq models.",
         "request_structure": {
             "query": "Optional[str] - The user's question or input",
             "context": "Optional[List[str]] - List of retrieved documents or source passages",
-            "output": "str - The model's generated response to evaluate (REQUIRED for most metrics)",
+            "output": "Optional[str] - The model's generated response to evaluate (REQUIRED for most metrics, not needed for conversation_completeness)",
+            "messages": "Optional[List[dict]] - List of conversation messages with 'role' and 'content' keys (REQUIRED for conversation_completeness)",
+            "expected_output": "Optional[str] - Expected/ideal output (required for contextual_recall, conversation_completeness)",
             "metric": "str | List[str] - Which metric(s) to use: single string, array of strings, or 'all' (default: faithfulness)"
         },
         "example_requests": {
@@ -778,6 +904,36 @@ async def metrics_info():
                 "query": "Can you help me write Selenium code?",
                 "output": "Yes, here is a basic example: driver.get('https://example.com')",
                 "metric": "answer_relevancy"
+            },
+            "conversation_completeness": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "I can't log in to Salesforce; it says invalid username or password."
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Understood. Are you on SSO/MFA? Any recent lockouts shown in Login History?"
+                    },
+                    {
+                        "role": "user",
+                        "content": "Yes, SSO and MFA enabled. Not sure about lockout."
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Try: 1) Verify username, 2) Unlock/reset password, 3) Check IdP SAML NameID, 4) Confirm MFA device/time sync, 5) Review Login History error code. Want the admin steps?"
+                    },
+                    {
+                        "role": "user",
+                        "content": "How do I unlock a user? for current users"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Setup → Users → select user → Unlock (and optionally Reset Password). If SSO, ensure NameID == username and minimal clock skew."
+                    }
+                ],
+                "expected_output": "The assistant should comprehensively address unlock procedures, SSO/MFA troubleshooting, and provide actionable admin steps.",
+                "metric": "conversation_completeness"
             },
             "multiple_metrics": {
                 "query": "What is Selenium?",

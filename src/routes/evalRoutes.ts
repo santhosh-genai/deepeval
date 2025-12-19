@@ -206,15 +206,16 @@ router.get("/health", (req: Request, res: Response) => {
  * POST /eval-only
  * Evaluate existing query-output pairs without LLM generation
  * 
- * Supported metrics: faithfulness, answer_relevancy, contextual_recall, contextual_precision, hallucination
+ * Supported metrics: faithfulness, answer_relevancy, contextual_recall, contextual_precision, hallucination, pii_leakage, conversation_completeness
  * 
  * Request body:
  * {
  *   query?: string - the input question (required for answer_relevancy),
- *   output?: string - the response to evaluate (required for faithfulness/answer_relevancy/hallucination),
+ *   output?: string - the response to evaluate (required for faithfulness/answer_relevancy/hallucination, NOT for conversation_completeness),
  *   context?: string | string[] - context/retrieval_context for faithfulness and hallucination evaluation,
  *   retrieval_context?: string | string[] - alias for 'context' field, required for contextual_recall/contextual_precision/hallucination,
- *   expected_output?: string - expected output for contextual_recall and contextual_precision,
+ *   expected_output?: string - expected output for contextual_recall, contextual_precision, and conversation_completeness,
+ *   messages?: Array - conversation messages array for conversation_completeness metric (required for conversation_completeness),
  *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
@@ -238,7 +239,34 @@ router.post(
     const metricName = metric?.toLowerCase() || "answer_relevancy";
     const contextualMetrics = ["contextual_precision", "contextual_recall"];
     const hallucinationMetrics = ["hallucination"];
+    const biasMetrics = ["bias"];
     const piiMetrics = ["pii_leakage"];
+    const conversationMetrics = ["conversation_completeness"];
+    
+    // Bias metric requires query and output
+    if (biasMetrics.includes(metricName)) {
+      if (!query) {
+        return res.status(400).json({
+          error: "Missing required field: query (the input question is required for bias metric)"
+        });
+      }
+      if (!output) {
+        return res.status(400).json({
+          error: "Missing required field: output (the model's response is required for bias metric)"
+        });
+      }
+      // retrieval_context is optional for bias metric
+    }
+    
+    // Conversation completeness requires messages, not output
+    if (conversationMetrics.includes(metricName)) {
+      const { messages } = req.body;
+      if (!messages || (Array.isArray(messages) && messages.length === 0)) {
+        return res.status(400).json({
+          error: "Missing required field: messages (conversation messages array is required for conversation_completeness metric)"
+        });
+      }
+    }
     
     // Hallucination metric requires context and output
     if (metricName === "hallucination") {
@@ -261,10 +289,10 @@ router.post(
       });
     }
     
-    const allContextualMetrics = [...contextualMetrics, ...hallucinationMetrics];
+    const allContextualMetrics = [...contextualMetrics, ...hallucinationMetrics, ...biasMetrics, ...conversationMetrics];
     if (!allContextualMetrics.includes(metricName) && !piiMetrics.includes(metricName) && !output) {
       return res.status(400).json({
-        error: "Missing required field: output (required for all metrics except contextual_precision and contextual_recall)"
+        error: "Missing required field: output (required for all metrics except contextual_precision, contextual_recall, bias, and conversation_completeness)"
       });
     }
 
@@ -277,7 +305,7 @@ router.post(
       provider: "groq"
     };
     
-    // ALWAYS add output if provided, even if undefined
+    // ALWAYS add output if provided, even if undefined (except for conversation_completeness)
     if (output !== undefined && output !== null) {
       evalParams.output = output;
     }
@@ -293,9 +321,15 @@ router.post(
       evalParams.context = Array.isArray(context) ? context : [context];
     }
 
-    // Add expected_output if provided (for contextual_recall, contextual_precision, hallucination)
+    // Add expected_output if provided (for contextual_recall, contextual_precision, conversation_completeness)
     if (expected_output !== undefined && expected_output !== null) {
       evalParams.expected_output = expected_output;
+    }
+
+    // Add messages if provided (for conversation_completeness)
+    const { messages } = req.body;
+    if (conversationMetrics.includes(metricName) && messages !== undefined && messages !== null) {
+      evalParams.messages = messages;
     }
 
     console.log(`\n[/api/eval-only] Route Processing`);
